@@ -7,14 +7,13 @@ import torch
 import argparse
 import triton_kernels
 import triton_kernels.swiglu
-
-import triton_kernels.distributed as triton_dist
-
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
-from triton_kernels.matmul_ogs import MicroscalingCtx, matmul_ogs, PrecisionConfig, FlexCtx
+from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, SwizzlingType
+from triton_kernels.matmul_ogs import MicroscalingCtx, matmul_ogs, PrecisionConfig, FlexCtx, FnSpecs, FusedActivation
 from triton_kernels.numerics import InFlexData
 from triton_kernels.target_info import is_hip, get_cdna_version
 from dataclasses import dataclass
+
+import triton_kernels.distributed as triton_dist
 
 if torch.cuda.is_available() and not is_hip():
     from triton._C.libtriton import nvidia
@@ -232,18 +231,16 @@ def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_
 
 if __name__ == "__main__":
     has_native_mx4 = torch.cuda.get_device_capability(0)[0] >= 10 or get_cdna_version() == 4
-    rank, world_size = triton_dist.setup()
-    if SPECS is None:
-        print("Current GPU has no specs provided, utilization is N/A")
+    batch_ranges_dense = [(1024, 32768, 1024)]
+    batch_ranges_moe = [(128, 512, 32), (512, 32000, 128)]
     dense_dtypes = ["fp8", "fp8"]
     quantized_dtypes = ["fp8", "mx4"] if has_native_mx4 else ["bf16", "mx4"]
+    _, world_size = triton_dist.setup()
     if world_size > 1:
         # Running all workloads at once may cause OOM on some GPUs such as H100 80GB.
         # Thus we request users to run each workload separately.
         # For example, to run the dense workload with 4 TP and 2 EP, use:
         # e.g., torchrun --nproc-per-node=4 ./bench_mlp.py --tp 2 --ep 2 --name llama4-maverick
-        batch_ranges_dense = [(1024, 32768, 1024)]
-        batch_ranges_moe = [(128, 512, 32), (512, 32000, 128)]
         argparse = argparse.ArgumentParser()
         argparse.add_argument("--tp", type=int, default=1)
         argparse.add_argument("--ep", type=int, default=1)
