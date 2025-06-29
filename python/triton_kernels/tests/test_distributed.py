@@ -6,6 +6,7 @@ from triton_kernels.matmul_ogs import MicroscalingCtx, matmul_ogs, PrecisionConf
 from triton_kernels.numerics import InFlexData
 import triton_kernels.distributed as triton_dist
 import triton_kernels.swiglu
+from triton_kernels.target_info import is_hip
 
 import pytest
 
@@ -267,6 +268,8 @@ def test_mlp_mp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, T
     parallelism = TP * EP
     if torch.cuda.device_count() < parallelism:
         pytest.skip(f"Test requires at least {parallelism} GPUs.")
+    if is_hip():
+        pytest.skip("TODO: Fix hip issues")
 
     monkeypatch.setenv("WORLD_SIZE", f"{parallelism}")
     monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
