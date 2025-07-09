@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+import triton.profiler.language as pl
 import pytest
 import itertools
 
@@ -118,6 +119,23 @@ def get_load_size_bytes(desc):
     return size
 
 
+"""
+XXX(Keren)
+
+Typical mbarrier
+use1:
+mbarrier.init(barrier, count=1)
+mbarrier.expect(barrier, size)
+tma.async_copy_global_to_shared(desc, coord, barrier, smem)
+mbarrier.wait(barrier, 0)
+
+use2:
+mbarrier.init(barrier, count=1)
+mbarrier.arrive(barrier, count=1)
+mbarrier.wait(barrier, 0)
+"""
+
+
 @gluon.jit
 def load_tensor_desc_to_smem(desc, coord, smem):
     size: gl.constexpr = get_load_size_bytes(desc)
@@ -194,6 +212,13 @@ def Channel(T, alloc_fn):
             for i in tl.static_range(self.num_buffers):
                 mbarrier.arrive(self.empty_bars.index(i), count=self.num_consumers)
 
+        ### XXX(Keren):
+        ### ready_bars: [0, 1, 2, 3, ....]
+        ### empty_bars: [0, 1, 2, 3, ....]
+        ### acquire_producer: wait until empty_bar is available, meaning that the consumer finished using the buffer.
+        ### emit a ready bar to signal when the data has been produced.
+        ### acquire_consumer: wait until ready_bar is available, meaning that the producer has put data in the buffer.
+        ### emit an empty_bar to signal when the use of the buffer is done.
         @gluon.jit
         def acquire_producer(self, index, phase):
             mem = self.mem.index(index)
@@ -245,6 +270,9 @@ def Channel(T, alloc_fn):
             self.index, self.phase = self.channel.increment(self.index, self.phase)
             return mem, ready_bar, self
 
+        ### XXX(Keren): I think the emplace and the get functions are too restrictive.
+        ### The ready of buffers do not always depend on store
+        ### Similarly the use of buffers do not always depend on load
         @gluon.jit
         def emplace(self, value):
             mem, ready_bar, self = self.acquire()
@@ -377,6 +405,7 @@ class MMAProducer:
     @gluon.jit
     def wait_and_issue_next(self, a, b, release_bars, use_acc):
         tmem, bar, self.producer = self.producer.acquire()
+        ### XXX(Keren): release bars will -1 the count of barriers?
         tcgen05_mma(a, b, tmem, use_acc=use_acc, mbarriers=[bar] + release_bars,
                     mbarrier_preds=[True] * (len(release_bars) + 1))
         return self
@@ -532,6 +561,7 @@ class AttentionTile:
         gl.store(m_ptrs, gl.convert_layout(self.m_i, coalesced))
         o_smem.store(o.to(config.dtype))
         fence_async_shared()
+        ### XXX(Keren) o_smem is generic proxy while desc_o is an async proxy
         store_smem_to_tensor_desc(desc_o, [prog.qo_offset_y + config.SPLIT_M * tile_id, 0], o_smem)
 
 
@@ -617,6 +647,7 @@ def _attn_fwd_load(config,  #
 
     num_loads = (hi - lo) // config.BLOCK_N
     if num_loads > 0:
+        # XXX(Keren): Manual pipelining
         load_k = load_k.wait_and_issue_next()
         for _ in range(num_loads - 1):
             load_k = load_k.wait_and_issue_next()
@@ -628,6 +659,7 @@ def _attn_fwd_load(config,  #
 def _attn_fwd_mma(config,  #
                   infos, k_load_ctx, v_load_ctx,  #
                   STAGE: gl.constexpr):
+    pl.enter_scope("attn_fwd_mma")
     prog = config.get_program()
     lo, hi = prog.get_loop_bounds(STAGE)
     info0 = infos[0]
@@ -648,35 +680,58 @@ def _attn_fwd_mma(config,  #
 
     num_mmas = (hi - lo) // config.BLOCK_N
     if num_mmas > 0:
-        k_smem, k_bar, k_consumer = k_consumer.acquire()
-        qk0_producer = qk0_producer.wait_and_issue_next(info0.q_smem, k_smem.permute((1, 0)), [k_bar], use_acc=False)
-        qk1_producer = qk1_producer.wait_and_issue_next(info1.q_smem, k_smem.permute((1, 0)), [k_bar], use_acc=False)
-        for _ in range(num_mmas - 1):
-            v_smem, v_bar, v_consumer = v_consumer.acquire()
-            p0_tmem, p0_bar, p0_consumer = p0_consumer.acquire()
-            o0_producer = o0_producer.wait_and_issue_next(p0_tmem, v_smem, [v_bar, p0_bar, qk_p_bar], use_acc=True)
-
+        # XXX(Keren): k_smem just filled by a producer, k_bar is actually k_empty_bar, will be signal once it's used
+        with pl.scope("k_consumer.acquire"):
             k_smem, k_bar, k_consumer = k_consumer.acquire()
-            mbarrier.wait(qk_p_bar, qk_p_phase)
-            qk_p_phase ^= 1
+        # XXX(Keren): each buffer has two consumers, thus k_bar's count = 2
+        with pl.scope("qk_producer.wait_and_issue_next"):
             qk0_producer = qk0_producer.wait_and_issue_next(info0.q_smem, k_smem.permute((1, 0)), [k_bar],
                                                             use_acc=False)
+            qk1_producer = qk1_producer.wait_and_issue_next(info1.q_smem, k_smem.permute((1, 0)), [k_bar],
+                                                            use_acc=False)
+        for _ in range(num_mmas - 1):
+            with pl.scope("v_consumer.acquire"):
+                v_smem, v_bar, v_consumer = v_consumer.acquire()
+            with pl.scope("p_consumer.acquire"):
+                p0_tmem, p0_bar, p0_consumer = p0_consumer.acquire()
+            # XXX(Keren): notifying that p0_bar has been used
+            # p0_bar only has one consumer
+            with pl.scope("o_producer.wait_and_issue_next"):
+                o0_producer = o0_producer.wait_and_issue_next(p0_tmem, v_smem, [v_bar, p0_bar, qk_p_bar], use_acc=True)
 
-            p1_tmem, p1_bar, p1_consumer = p1_consumer.acquire()
-            o1_producer = o1_producer.wait_and_issue_next(p1_tmem, v_smem, [v_bar, p1_bar, qk_p_bar], use_acc=True)
+            with pl.scope("k_consumer.acquire"):
+                k_smem, k_bar, k_consumer = k_consumer.acquire()
+            # XXX(Keren): why wait for qk_p_bar here?
+            mbarrier.wait(qk_p_bar, qk_p_phase)
+            qk_p_phase ^= 1
+            with pl.scope("qk_producer.wait_and_issue_next"):
+                qk0_producer = qk0_producer.wait_and_issue_next(info0.q_smem, k_smem.permute((1, 0)), [k_bar],
+                                                                use_acc=False)
+
+            with pl.scope("p1_consumer.acquire"):
+                p1_tmem, p1_bar, p1_consumer = p1_consumer.acquire()
+            with pl.scope("o1_producer.wait_and_issue_next"):
+                o1_producer = o1_producer.wait_and_issue_next(p1_tmem, v_smem, [v_bar, p1_bar, qk_p_bar], use_acc=True)
 
             mbarrier.wait(qk_p_bar, qk_p_phase)
             qk_p_phase ^= 1
-            qk1_producer = qk1_producer.wait_and_issue_next(info1.q_smem, k_smem.permute((1, 0)), [k_bar],
-                                                            use_acc=False)
-        v_smem, v_bar, v_consumer = v_consumer.acquire()
-        p0_tmem, p0_bar, p0_consumer = p0_consumer.acquire()
-        o0_producer = o0_producer.wait_and_issue_next(p0_tmem, v_smem, [v_bar, p0_bar], use_acc=True)
+            with pl.scope("qk1_producer.wait_and_issue_next"):
+                qk1_producer = qk1_producer.wait_and_issue_next(info1.q_smem, k_smem.permute((1, 0)), [k_bar],
+                                                                use_acc=False)
+        with pl.scope("v_consumer.acquire"):
+            v_smem, v_bar, v_consumer = v_consumer.acquire()
+        with pl.scope("p_consumer.acquire"):
+            p0_tmem, p0_bar, p0_consumer = p0_consumer.acquire()
+        with pl.scope("o_producer.wait_and_issue_next"):
+            o0_producer = o0_producer.wait_and_issue_next(p0_tmem, v_smem, [v_bar, p0_bar], use_acc=True)
 
-        p1_tmem, p1_bar, p1_consumer = p1_consumer.acquire()
-        o1_producer = o1_producer.wait_and_issue_next(p1_tmem, v_smem, [v_bar, p1_bar], use_acc=True)
+        with pl.scope("p1_consumer.acquire"):
+            p1_tmem, p1_bar, p1_consumer = p1_consumer.acquire()
+        with pl.scope("o1_producer.wait_and_issue_next"):
+            o1_producer = o1_producer.wait_and_issue_next(p1_tmem, v_smem, [v_bar, p1_bar], use_acc=True)
 
     mbarrier.invalidate(qk_p_bar)
+    pl.exit_scope("attn_fwd_mma")
 
 
 @gluon.jit
@@ -729,18 +784,20 @@ def _attn_fwd_correction_compute(config, mi_consumer, o_consumer, m_i):
         m_ij, mi_consumer = mi_consumer.get(mi_layout)
     alpha = gl.exp2(m_i - m_ij)
 
-    o_tmem, o_bar, o_consumer = o_consumer.acquire()
-    if config.SPLIT_D_FACTOR == 1:
-        o = o_tmem.load(config.o_layout)
-        o = _mul_f32x2(o, alpha[:, None])
-        o_tmem.store(o)
-    else:
-        for i in tl.static_range(config.SPLIT_D_FACTOR):
-            o_ref = o_tmem.slice(i * config.SPLIT_D, config.SPLIT_D)
-            o = o_ref.load(config.o_splitn_layout)
+    with pl.scope("o_consumer.acquire"):
+        o_tmem, o_bar, o_consumer = o_consumer.acquire()
+    with pl.scope("o_tmem.arrive"):
+        if config.SPLIT_D_FACTOR == 1:
+            o = o_tmem.load(config.o_layout)
             o = _mul_f32x2(o, alpha[:, None])
-            o_ref.store(o)
-    mbarrier.arrive(o_bar, count=1)
+            o_tmem.store(o)
+        else:
+            for i in tl.static_range(config.SPLIT_D_FACTOR):
+                o_ref = o_tmem.slice(i * config.SPLIT_D, config.SPLIT_D)
+                o = o_ref.load(config.o_splitn_layout)
+                o = _mul_f32x2(o, alpha[:, None])
+                o_ref.store(o)
+        mbarrier.arrive(o_bar, count=1)
     return mi_consumer, o_consumer, m_ij
 
 
@@ -748,6 +805,7 @@ def _attn_fwd_correction_compute(config, mi_consumer, o_consumer, m_i):
 def _attn_fwd_correction(config,  #
                          m_is, infos,  #
                          STAGE: gl.constexpr):
+    pl.enter_scope("attn_fwd_correction")
     prog = config.get_program()
     lo, hi = prog.get_loop_bounds(STAGE)
 
@@ -765,6 +823,7 @@ def _attn_fwd_correction(config,  #
 
     o0_consumer.acquire()
     o1_consumer.acquire()
+    pl.exit_scope("attn_fwd_correction")
     return (m_i0, m_i1)
 
 
@@ -793,9 +852,11 @@ def _softmax_tile(tile_id: gl.constexpr, config, info, STAGE: gl.constexpr):
     l_i = info.li_smem.load(qk_slice_dim1)
 
     for start_n in range(lo, hi, config.BLOCK_N):
-        qk, qk_consumer = qk_consumer.get(config.qk_layout)
+        with pl.scope("qk_consumer.get"):
+            qk, qk_consumer = qk_consumer.get(config.qk_layout)
         if config.HEAD_DIM == 128:
-            p_tmem, p_bar, p_producer = p_producer.acquire()
+            with pl.scope("p_producer.acquire"):
+                p_tmem, p_bar, p_producer = p_producer.acquire()
 
         if STAGE == 2:
             # Prevent LLVM from hoisting the partial sums, which triggers spilling.
@@ -804,29 +865,36 @@ def _softmax_tile(tile_id: gl.constexpr, config, info, STAGE: gl.constexpr):
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = gl.where(mask, qk, -1.0e8)
         m_ij = gl.maximum(m_i, gl.max(qk, 1) * config.qk_scale)
-        if config.mi_use_tmem:
-            mi_producer = mi_producer.emplace(gl.convert_layout(m_ij.expand_dims(1), config.mi_2d_layout))
-        else:
-            mi_producer = mi_producer.emplace(m_ij)
+        with pl.scope("mi_producer.emplace"):
+            if config.mi_use_tmem:
+                mi_producer = mi_producer.emplace(gl.convert_layout(m_ij.expand_dims(1), config.mi_2d_layout))
+            else:
+                mi_producer = mi_producer.emplace(m_ij)
         qk = qk * config.qk_scale - m_ij[:, None]
 
-        if config.HEAD_DIM == 64:
-            p = gl.exp2(qk)
-            l_ij = gl.sum(p, 1)
-            alpha = gl.exp2(m_i - m_ij)
-            p_producer = p_producer.emplace(p.to(config.dtype))
-        else:
-            qk0, qk1, = qk.reshape([config.SPLIT_M, 2, config.BLOCK_N // 2]).permute(0, 2, 1).split()
-            p0 = gl.exp2(qk0)
-            p_tmem.slice(0, config.BLOCK_N // 2).store(p0.to(config.dtype))
-            p1 = gl.exp2(qk1)
-            p_tmem.slice(config.BLOCK_N // 2, config.BLOCK_N // 2).store(p1.to(config.dtype))
-            mbarrier.arrive(p_bar, count=1)
-            p = gl.join(p0, p1).permute(0, 2, 1).reshape([config.SPLIT_M, config.BLOCK_N])
-            p = gl.convert_layout(p, config.qk_layout)
+        with pl.scope("p_producer.emplace"):
+            if config.HEAD_DIM == 64:
+                p = gl.exp2(qk)
+                l_ij = gl.sum(p, 1)
+                alpha = gl.exp2(m_i - m_ij)
+                p_producer = p_producer.emplace(p.to(config.dtype))
+            else:
+                qk0, qk1, = qk.reshape([config.SPLIT_M, 2, config.BLOCK_N // 2]).permute(0, 2, 1).split()
+                p0 = gl.exp2(qk0)
+                p_tmem.slice(0, config.BLOCK_N // 2).store(p0.to(config.dtype))
+                p1 = gl.exp2(qk1)
+                p_tmem.slice(config.BLOCK_N // 2, config.BLOCK_N // 2).store(p1.to(config.dtype))
+                #def emplace(self, value):
+                #    mem, ready_bar, self = self.acquire()
+                #    mem.store(value)
+                #    mbarrier.arrive(ready_bar, count=1)
+                #    return self
+                mbarrier.arrive(p_bar, count=1)
+                p = gl.join(p0, p1).permute(0, 2, 1).reshape([config.SPLIT_M, config.BLOCK_N])
+                p = gl.convert_layout(p, config.qk_layout)
 
-            l_ij = gl.sum(p, 1)
-            alpha = gl.exp2(m_i - m_ij)
+                l_ij = gl.sum(p, 1)
+                alpha = gl.exp2(m_i - m_ij)
 
         l_i = l_i * alpha + l_ij
         m_i = m_ij
@@ -838,14 +906,16 @@ def _softmax_tile(tile_id: gl.constexpr, config, info, STAGE: gl.constexpr):
 def _attn_fwd_softmax0(config,  #
                        infos, k_load_ctx, v_load_ctx,  #
                        STAGE: gl.constexpr):
-    _softmax_tile(0, config, infos[0], STAGE)
+    with pl.scope("softmax0"):
+        _softmax_tile(0, config, infos[0], STAGE)
 
 
 @gluon.jit
 def _attn_fwd_softmax1(config,  #
                        infos, k_load_ctx, v_load_ctx,  #
                        STAGE: gl.constexpr):
-    _softmax_tile(1, config, infos[1], STAGE)
+    with pl.scope("softmax1"):
+        _softmax_tile(1, config, infos[1], STAGE)
 
 
 @gluon.jit
@@ -886,6 +956,7 @@ def _gluon_attn(sm_scale, M, Z, H, N_CTX,  #
                 HEAD_DIM: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,  #
                 STAGE: gl.constexpr, dtype: gl.constexpr,  #
                 num_warps: gl.constexpr):
+    pl.enter_scope("[GLUON_ATTENTION]")
     qk_scale = sm_scale
     qk_scale *= 1.44269504
     config = AttentionConfig(qk_scale, Z, H, N_CTX, BLOCK_M, BLOCK_N, HEAD_DIM, dtype, num_warps, SPLIT_D_FACTOR=2)
@@ -901,13 +972,19 @@ def _gluon_attn(sm_scale, M, Z, H, N_CTX,  #
     info1 = InnerLoopInfo.create(config, tile1)
 
     if STAGE & 1:
-        tile0.m_i, tile1.m_i = _attn_fwd_inner(config, info0, info1, tile0.m_i, tile1.m_i, desc_k, desc_v, 4 - STAGE)
+        with pl.scope("STAGE=1"):
+            tile0.m_i, tile1.m_i = _attn_fwd_inner(config, info0, info1, tile0.m_i, tile1.m_i, desc_k, desc_v,
+                                                   4 - STAGE)
     if STAGE & 2:
-        tile0 = info0.consume_result(tile0)
-        info0 = InnerLoopInfo.create(config, tile0)
-        tile1 = info1.consume_result(tile1)
-        info1 = InnerLoopInfo.create(config, tile1)
-        tile0.m_i, tile1.m_i = _attn_fwd_inner(config, info0, info1, tile0.m_i, tile1.m_i, desc_k, desc_v, 2)
+        ### XXX(Keren): I understand that I need to store li to shared memory first
+        ### but then recreating loop info is quite weird, cannot I just store it explicitly?
+        ### Also why do I need to reallocate shared memory in innerloopinfo.create? config doesn't change
+        with pl.scope("STAGE=2"):
+            tile0 = info0.consume_result(tile0)
+            info0 = InnerLoopInfo.create(config, tile0)
+            tile1 = info1.consume_result(tile1)
+            info1 = InnerLoopInfo.create(config, tile1)
+            tile0.m_i, tile1.m_i = _attn_fwd_inner(config, info0, info1, tile0.m_i, tile1.m_i, desc_k, desc_v, 2)
 
     tile0.q_smem._keep_alive()
     tile1.q_smem._keep_alive()
@@ -916,6 +993,7 @@ def _gluon_attn(sm_scale, M, Z, H, N_CTX,  #
     info0.consume_result(tile0).do_epilogue(0, M, o_smem, desc_o, prog, config)
     info1.consume_result(tile1).do_epilogue(1, M, o_smem, desc_o, prog, config)
     o_smem._keep_alive()
+    pl.exit_scope("[GLUON_ATTENTION]")
 
 
 # ===-----------------------------------------------------------------------===#
