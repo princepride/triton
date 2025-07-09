@@ -48,10 +48,8 @@ struct ExtractSliceOpConversion
         LLVM::AMD::multiDimElementwise<int64_t, unsigned>(
             offsets, shapePerCTATile, std::divides<unsigned>());
 
-    Attribute srcEncoding = srcTy.getEncoding();
-    Attribute dstEncoding = dstTy.getEncoding();
-    auto linearLayoutSrc = triton::gpu::toLinearLayout(srcShape, srcEncoding);
-    auto linearLayoutDst = triton::gpu::toLinearLayout(dstShape, dstEncoding);
+    auto linearLayoutSrc = triton::gpu::toLinearLayout(srcTy);
+    auto linearLayoutDst = triton::gpu::toLinearLayout(dstTy);
 
     auto srcCTAOrder =
         LLVM::AMD::getCTATileOrder(srcTy.getContext(), linearLayoutSrc);

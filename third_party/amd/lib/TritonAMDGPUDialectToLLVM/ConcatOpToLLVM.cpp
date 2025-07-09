@@ -32,8 +32,8 @@ struct ConcatOpConversion : public ConvertOpToLLVMPattern<amdgpu::ConcatOp> {
     Attribute srcEncoding = srcType.getEncoding();
 
     MLIRContext *context = resultType.getContext();
-    auto linearLayoutSrc = triton::gpu::toLinearLayout(srcShape, srcEncoding);
-    auto linearLayoutDst = triton::gpu::toLinearLayout(dstShape, dstEncoding);
+    auto linearLayoutSrc = triton::gpu::toLinearLayout(srcType);
+    auto linearLayoutDst = triton::gpu::toLinearLayout(resultType);
     auto srcCTAOrder = LLVM::AMD::getCTATileOrder(context, linearLayoutSrc);
     auto dstCTAOrder = LLVM::AMD::getCTATileOrder(context, linearLayoutSrc);
 
